@@ -1,0 +1,191 @@
+package ch.ethz.systems.netbench.xpt.sppifo.ports.PIFO_WFQ;
+
+import ch.ethz.systems.netbench.core.network.Packet;
+import ch.ethz.systems.netbench.xpt.tcpbase.FullExtTcpPacket;
+import ch.ethz.systems.netbench.xpt.tcpbase.PriorityHeader;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Queue;
+import java.util.ArrayList;
+import java.util.concurrent.PriorityBlockingQueue;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.Lock;
+import ch.ethz.systems.netbench.xpt.sppifo.ports.PIFO_WFQ.WFQPIFOLeafQueue;
+
+public class WFQPIFOQueue extends PriorityBlockingQueue implements Queue {
+
+    private WFQPIFOLeafQueue leftQueue, rightQueue;
+    private final ArrayList<WFQPIFOLeafQueue> queueList;
+    private final int maxItems;
+    private Lock reentrantLock;
+    private int ownId;
+    private int targetId;
+
+    /*STFQ Attributes*/
+    private final Map last_finishTime;
+    private int round;
+    private int numQueues = 10;
+
+    public WFQPIFOQueue(long maxItems, int targetId, int ownId){
+        
+        this.queueList = new ArrayList((int)numQueues);
+        this.ownId = ownId;
+        this.targetId = targetId;
+
+        this.maxItems = (int)maxItems;
+        this.reentrantLock = new ReentrantLock();
+
+        /*STFQ Attributes*/
+        this.last_finishTime = new HashMap();
+        this.round = 0;
+
+        this.leftQueue = new WFQPIFOLeafQueue(maxItems / 2, targetId, ownId);
+        this.rightQueue = new WFQPIFOLeafQueue(maxItems / 2, targetId, ownId);
+        for (int i=0; i<(int)numQueues; i++){
+            // fifo = new ArrayBlockingQueue<Packet>((int)perQueueCapacity);
+            queueList.add(new WFQPIFOLeafQueue(maxItems / numQueues, targetId, ownId));
+            // queueBounds.put(i, 0);
+        }
+    }
+
+    /*Rank computation following STFQ as proposed in the PIFO paper*/
+
+    public int computeRank(Packet packet){
+        int startTime = this.round;
+        //if (this.ownId == 0){
+        //    System.out.println("Rank (" + p.getFlowId() + ") set to " + startTime);
+        //}
+        FullExtTcpPacket p = (FullExtTcpPacket) packet;
+
+        if(last_finishTime.containsKey(p.getLeftOrRight())){
+            //if (this.ownId == 0){
+            //    System.out.println("Last containing (" + p.getFlowId() + ") is " + last_finishTime.get(p.getFlowId()));
+            //}
+            if((int) last_finishTime.get(p.getLeftOrRight()) > round){
+                startTime = (int)last_finishTime.get(p.getLeftOrRight());
+            }
+        }
+        //if (this.ownId == 0){
+        //    System.out.println("Rank (" + p.getFlowId() + ") updated to " + startTime);
+        //}
+        int flowWeight = 8;
+        int finishingTime_update = startTime + ((int)p.getSizeBit()/flowWeight);
+        last_finishTime.put(p.getLeftOrRight(), finishingTime_update);
+        //if (this.ownId == 0){
+        //    System.out.println("Finishing time (" + p.getFlowId() + ") set to " + finishingTime_update);
+        //}
+        return startTime;
+    }
+
+    /*Round is the virtual start time of the last dequeued packet across all flows*/
+    public void updateRound(Packet p){
+        FullExtTcpPacket header = (FullExtTcpPacket) p;
+        int rank = (int)header.getRootPriority();
+        this.round = rank;
+        //if (this.ownId == 0) {
+        //    System.out.println("Round updated by (" + p.getFlowId() + ") to " + rank);
+        //}
+    }
+
+    public Packet offerPacket(Object o, int ownID) {
+
+        this.reentrantLock.lock();
+
+        /*Rank computation*/
+        FullExtTcpPacket packet = (FullExtTcpPacket) o;
+
+        int leftorRight = packet.getLeftOrRight();
+        this.queueList.get(leftorRight).offerPacket(o, ownID);
+        // if (leftorRight == 0) {
+        //     this.leftQueue.offerPacket(o, ownID);
+        // }
+        // else {
+        //     this.rightQueue.offerPacket(o, ownID);
+        // }
+
+        int rank = this.computeRank(packet);
+
+
+
+        FullExtTcpPacket header = (FullExtTcpPacket) packet;
+        header.setRootPriority((long)rank); // This makes no effect since each switch recomputes the ranks
+
+        boolean success = true;
+        try {
+            /* As the original PBQ is has no limited size, the packet is always inserted */
+            success = super.offer(packet); /* This method will always return true */
+
+            /* We control the size by removing the extra packet */
+            if (this.size()>maxItems-1){
+                Object[] contentPIFO = this.toArray();
+                Arrays.sort(contentPIFO);
+                packet = (FullExtTcpPacket) contentPIFO[this.size()-1];
+                this.remove(packet);
+//                return packet;
+                leftorRight = packet.getLeftOrRight();
+                contentPIFO = this.queueList.get(leftorRight).toArray();
+                Arrays.sort(contentPIFO);
+                packet = (FullExtTcpPacket) contentPIFO[this.queueList.get(leftorRight).size()-1];
+                this.queueList.get(leftorRight).remove(packet);
+                // SimulationLogger.increaseStatisticCounter("PACKETS_DROPPED at queue");
+                return packet;
+                // if (leftorRight == 0) {
+                //     contentPIFO = this.leftQueue.toArray();
+                //     Arrays.sort(contentPIFO);
+                //     packet = (FullExtTcpPacket) contentPIFO[this.leftQueue.size()-1];
+                //     this.leftQueue.remove(packet);
+                //     return packet;
+                // }
+                // else {
+                //     contentPIFO = this.rightQueue.toArray();
+                //     Arrays.sort(contentPIFO);
+                //     packet = (FullExtTcpPacket) contentPIFO[this.rightQueue.size()-1];
+                //     this.rightQueue.remove(packet);
+                //     return packet;
+                // }
+            }
+            return null;
+        } finally {
+            this.reentrantLock.unlock();
+        }
+    }
+
+    @Override
+    public Object poll() {
+        Packet retPacket;
+
+        this.reentrantLock.lock();
+        try {
+            Packet packet = (Packet) super.poll(); // As the super queue is unbounded, this method will always return true
+            FullExtTcpPacket p = (FullExtTcpPacket) packet;
+            int leftorRight = p.getLeftOrRight();
+            retPacket = (Packet) this.queueList.get(leftorRight).poll();
+            // if (leftorRight == 0) {
+            //     retPacket = (Packet) this.leftQueue.poll();
+            // }
+            // else {
+            //     retPacket = (Packet) this.rightQueue.poll();
+            // }
+            // Update round number
+            this.updateRound(packet);
+            return retPacket;
+        } catch (Exception e){
+            return null;
+        } finally {
+            this.reentrantLock.unlock();
+        }
+    }
+
+    @Override
+    public int size() {
+        return super.size();
+    }
+
+    @Override
+    public boolean isEmpty() {
+        return super.isEmpty();
+    }
+
+}
